@@ -1,0 +1,15 @@
+{
+  "name": "family-media",
+  "version": "1.0.0",
+  "private": true,
+  "description": "家里的手机连上 Wi-Fi，看荞荞的照片和视频",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test"
+  }
+}
