@@ -415,32 +415,128 @@ function warm(url) {
 
 function prefetch(index) {
   const count = viewerItems.length;
-  for (const delta of [-1, 1, 2]) {
+  for (const delta of [-2, -1, 1, 2]) {
     const item = viewerItems[wrap(index + delta, count)];
     if (!item) continue;
-    warm(item.kind === 'photo' ? item.fileUrl : item.thumbUrl);
+    warm(item.thumbUrl);
+  }
+  for (const delta of [-1, 1, 2]) {
+    const item = viewerItems[wrap(index + delta, count)];
+    if (item?.kind === 'photo') warm(item.fileUrl);
   }
 }
 
-function fillSlide(slide, item) {
+function makeSpinner() {
+  const spin = el('div', 'spinner');
+  spin.setAttribute('aria-hidden', 'true');
+  spin.append(el('span'));
+  return spin;
+}
+
+function settleFrame(frame) {
+  if (frame.classList.contains('is-failed')) return;
+  frame.classList.add('is-ready');
+  const spin = frame.querySelector('.spinner');
+  if (spin) spin.hidden = true;
+}
+
+function failFrame(frame) {
+  frame.classList.add('is-failed');
+  const spin = frame.querySelector('.spinner');
+  if (spin) spin.hidden = true;
+  frame.querySelector('.original')?.remove();
+}
+
+function previewImage(item) {
+  if (!item.thumbUrl) return null;
+  const preview = document.createElement('img');
+  preview.className = 'preview';
+  preview.alt = '';
+  preview.draggable = false;
+  preview.decoding = 'sync';
+  preview.setAttribute('aria-hidden', 'true');
+  preview.fetchPriority = 'high';
+  preview.addEventListener('error', () => {
+    preview.remove();
+    preview.parentElement?.classList.add('no-preview');
+  });
+  preview.src = item.thumbUrl;
+  return preview;
+}
+
+function watchStill(img, frame) {
+  const reveal = () => {
+    if (frame.classList.contains('is-ready') || frame.classList.contains('is-failed')) return;
+    if (typeof img.decode === 'function') img.decode().then(() => settleFrame(frame), () => settleFrame(frame));
+    else settleFrame(frame);
+  };
+  img.addEventListener('load', reveal, { once: true });
+  img.addEventListener('error', () => failFrame(frame), { once: true });
+}
+
+function watchVideo(video, frame, play) {
+  const reveal = () => {
+    if (frame.classList.contains('is-ready') || frame.classList.contains('is-failed')) return;
+    settleFrame(frame);
+    if (video.paused) play.hidden = false;
+  };
+  video.addEventListener('loadeddata', reveal);
+  video.addEventListener('canplay', reveal);
+  video.addEventListener('error', () => {
+    if (frame.classList.contains('is-ready')) return;
+    failFrame(frame);
+    play.hidden = false;
+  }, { once: true });
+  return reveal;
+}
+
+function clearSlide(slide) {
   slide.replaceChildren();
-  if (!item) return;
+  delete slide.dataset.itemId;
+}
+
+function tuneCurrent(slide) {
+  if (!slide) return;
+  const preview = slide.querySelector('.preview');
+  if (preview) preview.fetchPriority = 'high';
+  const original = slide.querySelector('img.original');
+  if (original) original.fetchPriority = 'high';
+  const video = slide.querySelector('video');
+  if (video && video.preload !== 'auto') {
+    video.preload = 'auto';
+    if (video.readyState >= 2) video.dispatchEvent(new Event('loadeddata'));
+  }
+}
+
+function fillSlide(slide, item, { eager = false } = {}) {
+  slide.replaceChildren();
+  if (!item) {
+    delete slide.dataset.itemId;
+    return;
+  }
+  slide.dataset.itemId = item.id;
+  const frame = el('div', 'frame');
+  const preview = previewImage(item);
+  const spin = makeSpinner();
+  if (preview) frame.append(preview);
+
   if (item.kind === 'video') {
     const video = document.createElement('video');
-    video.poster = item.thumbUrl;
-    video.src = item.fileUrl;
+    video.className = 'original';
+    video.poster = item.thumbUrl || '';
     video.controls = true;
     video.playsInline = true;
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
-    video.preload = 'metadata';
+    video.preload = eager ? 'auto' : 'metadata';
     video.controlsList = 'nodownload';
     const play = el('button', 'big-play');
     play.type = 'button';
+    play.hidden = true;
     play.setAttribute('aria-label', '播放视频');
     play.innerHTML = PLAY;
     const hide = () => { play.hidden = true; };
-    const show = () => { play.hidden = false; };
+    const show = () => { if (frame.classList.contains('is-ready')) play.hidden = false; };
     play.addEventListener('click', (event) => {
       event.stopPropagation();
       video.play().catch(() => { play.hidden = false; });
@@ -448,16 +544,30 @@ function fillSlide(slide, item) {
     video.addEventListener('play', hide);
     video.addEventListener('pause', show);
     video.addEventListener('ended', show);
+    frame.append(video, spin);
     const gesture = el('div', 'gesture');
-    slide.append(video, play, gesture);
+    slide.append(frame, play, gesture);
+    const reveal = watchVideo(video, frame, play);
+    video.src = item.fileUrl;
+    if (video.readyState >= 2) reveal();
     return;
   }
+
   const img = document.createElement('img');
+  img.className = 'original';
   img.alt = '照片';
   img.draggable = false;
-  img.src = item.fileUrl;
+  img.decoding = 'async';
+  img.fetchPriority = eager ? 'high' : 'auto';
+  frame.append(img, spin);
   const gesture = el('div', 'gesture full');
-  slide.append(img, gesture);
+  slide.append(frame, gesture);
+  watchStill(img, frame);
+  img.src = item.fileUrl;
+  if (img.complete) {
+    if (img.naturalWidth > 0) settleFrame(frame);
+    else failFrame(frame);
+  }
 }
 
 function likedSet() {
@@ -619,7 +729,36 @@ async function sendComment() {
   }
 }
 
-function paintViewer(index) {
+function placeSlides(track, indexes, count, dir) {
+  let slides = [...track.children];
+  const current = viewerItems[indexes[1]];
+  let reused = false;
+  if (dir && count > 1 && slides.length === 3 && current) {
+    if (dir > 0 && slides[2].dataset.itemId === current.id) {
+      track.append(slides[0]);
+      slides = [...track.children];
+      fillSlide(slides[2], viewerItems[indexes[2]]);
+      reused = true;
+    } else if (dir < 0 && slides[0].dataset.itemId === current.id) {
+      track.prepend(slides[2]);
+      slides = [...track.children];
+      fillSlide(slides[0], viewerItems[indexes[0]]);
+      reused = true;
+    }
+  }
+  if (!reused) {
+    slides.forEach((slide, slot) => {
+      if (count <= 1 && slot !== 1) {
+        clearSlide(slide);
+        return;
+      }
+      fillSlide(slide, viewerItems[indexes[slot]], { eager: slot === 1 });
+    });
+  }
+  tuneCurrent(track.children[1]);
+}
+
+function paintViewer(index, { dir = 0 } = {}) {
   const count = viewerItems.length;
   const previous = viewerEl.dataset.index;
   viewerIndex = wrap(index, count);
@@ -628,19 +767,12 @@ function paintViewer(index) {
     if (sheet) sheet.hidden = true;
     setEmojiOpen(false);
   }
-  const slides = viewerEl.querySelectorAll('.slide');
   const indexes = count <= 1
     ? [0, 0, 0]
     : [wrap(viewerIndex - 1, count), viewerIndex, wrap(viewerIndex + 1, count)];
-  slides.forEach((slide, slot) => {
-    if (count <= 1 && slot !== 1) {
-      slide.replaceChildren();
-      return;
-    }
-    fillSlide(slide, viewerItems[indexes[slot]]);
-  });
   const track = viewerEl.querySelector('.track');
   track.style.transition = 'none';
+  placeSlides(track, indexes, count, dir);
   track.style.transform = 'translate3d(-33.333333%, 0, 0)';
   const item = viewerItems[viewerIndex];
   viewerEl.classList.toggle('is-video', item?.kind === 'video');
@@ -661,7 +793,7 @@ function shiftViewer(dir) {
   dismissHint();
   viewerEl.querySelectorAll('video').forEach((video) => video.pause());
   if (reduce) {
-    paintViewer(viewerIndex + dir);
+    paintViewer(viewerIndex + dir, { dir });
     return;
   }
   viewerBusy = true;
@@ -672,7 +804,7 @@ function shiftViewer(dir) {
     if (settled) return;
     settled = true;
     track.removeEventListener('transitionend', onEnd);
-    paintViewer(viewerIndex + dir);
+    paintViewer(viewerIndex + dir, { dir });
     viewerBusy = false;
   };
   const onEnd = (event) => {
