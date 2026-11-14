@@ -93,12 +93,16 @@ test('library, thumbnails, and video byte ranges', async (t) => {
   const source = await script.text();
   assert.match(source, /img\.src = item\.thumbUrl/);
   assert.match(source, /img\.src = item\.fileUrl/);
+  assert.match(source, /preview\.className = 'preview'/);
+  assert.match(source, /el\('div', 'spinner'\)/);
+  assert.match(source, /placeSlides/);
   assert.match(source, /\/api\/albums\?offset=/);
   assert.match(source, /const BATCH = 3/);
   assert.match(source, /加载更多/);
   assert.match(source, /没有更多了/);
   assert.doesNotMatch(source, /IntersectionObserver/);
   assert.doesNotMatch(source, /img\.src = item\.viewUrl/);
+  assert.doesNotMatch(source, /original\.src = item\.viewUrl/);
 
   const ranged = await fetch(`${base}${video.fileUrl}`, { headers: { Range: 'bytes=0-9' } });
   assert.equal(ranged.status, 206);
