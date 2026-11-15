@@ -92,7 +92,9 @@ test('library, thumbnails, and video byte ranges', async (t) => {
   const script = await fetch(`${base}/app.js`);
   const source = await script.text();
   assert.match(source, /img\.src = item\.thumbUrl/);
-  assert.match(source, /img\.src = item\.fileUrl/);
+  assert.match(source, /return item\.viewUrl \|\| item\.fileUrl/);
+  assert.match(source, /video\.src = item\.fileUrl/);
+  assert.match(source, /preview\.hidden = true/);
   assert.match(source, /preview\.className = 'preview'/);
   assert.match(source, /el\('div', 'spinner'\)/);
   assert.match(source, /placeSlides/);
@@ -101,8 +103,11 @@ test('library, thumbnails, and video byte ranges', async (t) => {
   assert.match(source, /加载更多/);
   assert.match(source, /没有更多了/);
   assert.doesNotMatch(source, /IntersectionObserver/);
-  assert.doesNotMatch(source, /img\.src = item\.viewUrl/);
-  assert.doesNotMatch(source, /original\.src = item\.viewUrl/);
+  assert.doesNotMatch(source, /warm\(item\.fileUrl\)/);
+  assert.doesNotMatch(source, /img\.src = item\.fileUrl/);
+  assert.doesNotMatch(source, /big-play/);
+  assert.match(source, /video\.controls = true/);
+  assert.match(source, /lockPageScroll/);
 
   const ranged = await fetch(`${base}${video.fileUrl}`, { headers: { Range: 'bytes=0-9' } });
   assert.equal(ranged.status, 206);
@@ -254,5 +259,8 @@ test('demo media is ready to open', async () => {
   assert.equal(all.filter((item) => item.kind === 'photo').length >= 4, true);
   assert.equal(all.some((item) => item.kind === 'video'), true);
   const october = lib.albums.find((album) => album.title === '2026年10月');
-  assert.equal(october.items[0].place, '北纬 31.23° 东经 121.47°');
+  assert.ok(Math.abs(october.items[0].latitude - 31.23) < 0.02);
+  assert.ok(Math.abs(october.items[0].longitude - 121.47) < 0.02);
+  assert.equal(october.items[0].place, undefined);
+  assert.equal(JSON.stringify(october).includes('北纬'), false);
 });

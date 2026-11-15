@@ -12,7 +12,8 @@ test('jpeg exif date round-trips and prefers DateTimeOriginal', () => {
   assert.equal(found.takenAt, '2019-04-05');
   assert.equal(new Date(found.sortAt).getFullYear(), 2019);
   assert.equal(embedJpegDate(stamped, '2020-01-01').equals(stamped), true);
-  assert.equal(readJpegTakenAt(stamped).place, null);
+  assert.equal(readJpegTakenAt(stamped).latitude ?? null, null);
+  assert.equal(readJpegTakenAt(stamped).longitude ?? null, null);
 });
 
 test('jpeg gps is read back and not invented when absent', () => {
@@ -20,9 +21,12 @@ test('jpeg gps is read back and not invented when absent', () => {
   const stamped = embedJpegGps(plain, '2026-10-20', 31.23, 121.47);
   const found = readJpegTakenAt(stamped);
   assert.equal(found.takenAt, '2026-10-20');
-  assert.equal(found.place, '北纬 31.23° 东经 121.47°');
-  const south = embedJpegGps(plain, '2026-01-08', -33.87, 151.21);
-  assert.equal(readJpegTakenAt(south).place, '南纬 33.87° 东经 151.21°');
+  assert.ok(Math.abs(found.latitude - 31.23) < 0.001);
+  assert.ok(Math.abs(found.longitude - 121.47) < 0.001);
+  assert.equal(JSON.stringify(found).includes('北纬'), false);
+  const south = readJpegTakenAt(embedJpegGps(plain, '2026-01-08', -33.87, 151.21));
+  assert.ok(Math.abs(south.latitude + 33.87) < 0.001);
+  assert.ok(Math.abs(south.longitude - 151.21) < 0.001);
 });
 
 test('plain folders become months and keep stories for later', async () => {
