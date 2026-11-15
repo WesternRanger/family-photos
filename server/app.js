@@ -95,8 +95,8 @@ async function sendStatic(req, res, config, name) {
   });
 }
 
-export function createApp(config, { ttl = 3000 } = {}) {
-  const catalog = createCatalog(config.mediaDir, { ttl, cacheDir: config.cacheDir });
+export function createApp(config, { ttl = 60000, geocode } = {}) {
+  const catalog = createCatalog(config.mediaDir, { ttl, cacheDir: config.cacheDir, geocode });
   const attempts = new Map();
 
   function isLocked(ip) {
@@ -193,9 +193,10 @@ export function createApp(config, { ttl = 3000 } = {}) {
         sendJson(req, res, 404, { error: 'thumb_failed', message: '这张暂时显示不了。' });
         return;
       }
+      const versioned = url.searchParams.has('v');
       sendFile(req, res, resolved.file, {
         contentType: resolved.contentType,
-        cacheControl: 'private, max-age=86400',
+        cacheControl: versioned ? 'public, max-age=31536000, immutable' : 'private, max-age=86400',
       });
       return;
     }
@@ -268,6 +269,29 @@ export function createApp(config, { ttl = 3000 } = {}) {
             error: 'media_dir_missing',
             message: '还没有找到照片文件夹。请在电脑上把 MEDIA_DIR 指到放照片的文件夹，然后重启服务。',
           });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    const placePath = pathname.match(/^\/api\/place\/([a-f0-9]{16})$/);
+    if (req.method === 'GET' && placePath) {
+      if (!isAuthed(req, config)) {
+        sendJson(req, res, 401, { error: 'need_code', message: '请输入查看码' });
+        return;
+      }
+      try {
+        const found = await catalog.place(placePath[1]);
+        if (!found) {
+          sendJson(req, res, 404, { error: 'missing', message: '没有这张照片。' });
+          return;
+        }
+        sendJson(req, res, 200, found);
+      } catch (err) {
+        if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+          sendJson(req, res, 404, { error: 'media_dir_missing', message: '还没有找到照片文件夹。' });
           return;
         }
         throw err;

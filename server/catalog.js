@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { engagementSummary } from './engagement.js';
 import { computeStamp, scanLibrary } from './library.js';
+import { cleanPlace, createGeocoder } from './places.js';
 
 const PAGE = 3;
 
@@ -99,7 +100,8 @@ function hydrate(rootReal, data) {
       kind: raw.kind,
       sortAt: raw.sortAt,
       takenAt: raw.takenAt,
-      place: raw.place || null,
+      latitude: coord(raw.latitude, 90),
+      longitude: coord(raw.longitude, 180),
       mtimeMs: raw.mtimeMs,
       size: raw.size,
       likes: raw.likes || 0,
@@ -119,8 +121,15 @@ function hydrate(rootReal, data) {
   return { mode: 'albums', albums, itemsById };
 }
 
+function coord(value, limit) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || Math.abs(n) > limit) return null;
+  return n;
+}
+
 function serialize(lib, stamp) {
   return {
+    schema: 2,
     stamp,
     albums: lib.albums.map((album) => ({
       id: album.id,
@@ -139,7 +148,8 @@ function serialize(lib, stamp) {
       kind: item.kind,
       sortAt: item.sortAt,
       takenAt: item.takenAt,
-      place: item.place || null,
+      latitude: coord(item.latitude, 90),
+      longitude: coord(item.longitude, 180),
       mtimeMs: item.mtimeMs,
       size: item.size,
       likes: item.likes || 0,
@@ -183,26 +193,36 @@ async function buildIndex(mediaDir) {
   return { mode: 'albums', albums, itemsById };
 }
 
-async function publicAlbum(lib, id) {
+async function publicAlbum(lib, id, geocoder) {
   const album = lib.albums.find((entry) => entry.id === id);
   if (!album) return null;
-  const items = [];
+  const raw = [];
   for (const itemId of album.itemIds) {
     const item = lib.itemsById.get(itemId);
-    if (!item) continue;
-    const saved = await engagementSummary(item);
-    items.push({
+    if (item) raw.push(item);
+  }
+  const [savedList, places] = await Promise.all([
+    mapPool(raw, 8, (item) => engagementSummary(item)),
+    Promise.all(raw.map(async (item) => {
+      if (!Number.isFinite(item.latitude) || !Number.isFinite(item.longitude) || !geocoder) return null;
+      return cleanPlace(await geocoder.peek(item.latitude, item.longitude));
+    })),
+  ]);
+  const items = raw.map((item, index) => {
+    const saved = savedList[index];
+    return {
       id: item.id,
       kind: item.kind,
       takenAt: item.takenAt,
-      place: item.place || null,
+      located: Number.isFinite(item.latitude) && Number.isFinite(item.longitude),
+      place: places[index],
       likes: saved.likes,
       comments: saved.comments,
       thumbUrl: thumbUrl(item),
       viewUrl: `/media/view/${item.id}?v=${Math.round(item.mtimeMs)}`,
       fileUrl: fileUrl(item),
-    });
-  }
+    };
+  });
   return {
     id: album.id,
     title: album.title,
@@ -214,17 +234,20 @@ async function publicAlbum(lib, id) {
   };
 }
 
-export function createCatalog(mediaDir, { ttl = 3000, cacheDir } = {}) {
+export function createCatalog(mediaDir, { ttl = 3000, cacheDir, geocode } = {}) {
   let memory = null;
   let pending = null;
   const stats = { scans: 0 };
   const indexPath = cacheDir ? path.join(cacheDir, 'library-index.json') : '';
+  const geocoder = typeof geocode === 'function'
+    ? { lookup: geocode, peek: async () => null }
+    : geocode || createGeocoder({ cacheDir });
 
   async function readDisk() {
     if (!indexPath) return null;
     try {
       const data = JSON.parse(await fs.readFile(indexPath, 'utf8'));
-      if (!data || typeof data.stamp !== 'string' || !Array.isArray(data.albums) || !Array.isArray(data.items)) return null;
+      if (!data || data.schema !== 2 || typeof data.stamp !== 'string' || !Array.isArray(data.albums) || !Array.isArray(data.items)) return null;
       return data;
     } catch {
       return null;
@@ -279,13 +302,30 @@ export function createCatalog(mediaDir, { ttl = 3000, cacheDir } = {}) {
     return lib;
   }
 
-  function get() {
+  async function get() {
     const now = Date.now();
-    if (memory && now - memory.checked < ttl) return Promise.resolve(memory.lib);
-    if (pending) return pending;
-    pending = refresh().finally(() => {
-      pending = null;
-    });
+    if (memory && now - memory.checked < ttl) return memory.lib;
+    if (!memory) {
+      const disk = await readDisk();
+      if (disk) {
+        try {
+          const rootReal = await fs.realpath(mediaDir);
+          memory = { stamp: disk.stamp, lib: hydrate(rootReal, disk), checked: 0 };
+        } catch (err) {
+          if (!missingDir(err)) throw err;
+        }
+      }
+    }
+    if (!pending) {
+      pending = refresh().then((lib) => lib, (err) => {
+        console.error(err);
+        if (memory) return memory.lib;
+        throw err;
+      }).finally(() => {
+        pending = null;
+      });
+    }
+    if (memory) return memory.lib;
     return pending;
   }
 
@@ -296,7 +336,14 @@ export function createCatalog(mediaDir, { ttl = 3000, cacheDir } = {}) {
       return pageAlbumSummaries(await get(), offset, limit);
     },
     async album(id) {
-      return publicAlbum(await get(), id);
+      return publicAlbum(await get(), id, geocoder);
+    },
+    async place(id) {
+      const lib = await get();
+      const item = lib.itemsById.get(id);
+      if (!item) return null;
+      if (!Number.isFinite(item.latitude) || !Number.isFinite(item.longitude)) return { place: null };
+      return { place: cleanPlace(await geocoder.lookup(item.latitude, item.longitude)) };
     },
     async remember(itemId, saved) {
       const lib = await get();

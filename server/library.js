@@ -274,13 +274,18 @@ function readExifDate(buffer, tiff) {
   }
   const raw = typeof original === 'string' ? original : ifd0.get(0x0132);
   const date = typeof raw === 'string' ? parseExifDate(raw) : null;
-  let place = null;
+  let gps = null;
   const gpsOff = ifd0.get(0x8825);
   if (typeof gpsOff === 'number') {
-    place = readGpsPlace(buffer, tiff, tiff + gpsOff, u16, u32, le);
+    gps = readGpsPlace(buffer, tiff, tiff + gpsOff, u16, u32, le);
   }
-  if (!date && !place) return null;
-  return { takenAt: date?.takenAt, sortAt: date?.sortAt, place };
+  if (!date && !gps) return null;
+  return {
+    takenAt: date?.takenAt,
+    sortAt: date?.sortAt,
+    latitude: gps?.latitude ?? null,
+    longitude: gps?.longitude ?? null,
+  };
 }
 
 function readIfd(buffer, tiff, ifd, u16, u32) {
@@ -361,20 +366,22 @@ function readGpsPlace(buffer, tiff, ifd, u16, u32, le) {
       else lon = values;
     }
   }
-  return formatPlace(latRef, lat, lonRef, lon);
+  return gpsPoint(latRef, lat, lonRef, lon);
 }
 
-function formatPlace(latRef, lat, lonRef, lon) {
+function gpsPoint(latRef, lat, lonRef, lon) {
   if (!lat || lat.length < 3 || !lon || lon.length < 3) return null;
-  const latLabel = latRef.toUpperCase().startsWith('S') ? '南纬' : latRef.toUpperCase().startsWith('N') ? '北纬' : '';
-  const lonLabel = lonRef.toUpperCase().startsWith('W') ? '西经' : lonRef.toUpperCase().startsWith('E') ? '东经' : '';
-  if (!latLabel || !lonLabel) return null;
+  const latRefText = String(latRef || '').toUpperCase();
+  const lonRefText = String(lonRef || '').toUpperCase();
+  const latSign = latRefText.startsWith('S') ? -1 : latRefText.startsWith('N') ? 1 : 0;
+  const lonSign = lonRefText.startsWith('W') ? -1 : lonRefText.startsWith('E') ? 1 : 0;
+  if (!latSign || !lonSign) return null;
   const decimal = (parts) => parts[0] + parts[1] / 60 + parts[2] / 3600;
-  const latitude = decimal(lat);
-  const longitude = decimal(lon);
+  const latitude = latSign * decimal(lat);
+  const longitude = lonSign * decimal(lon);
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
-  if (latitude > 90 || longitude > 180) return null;
-  return `${latLabel} ${latitude.toFixed(2)}° ${lonLabel} ${longitude.toFixed(2)}°`;
+  if (Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return null;
+  return { latitude, longitude };
 }
 
 function parseExifDate(raw) {
@@ -441,7 +448,8 @@ async function describeFiles(absList, rootReal) {
       kind,
       sortAt: taken?.sortAt ?? st.mtimeMs,
       takenAt: taken?.takenAt ?? localDate(st.mtimeMs),
-      place: typeof taken?.place === 'string' && taken.place ? taken.place : null,
+      latitude: Number.isFinite(taken?.latitude) ? taken.latitude : null,
+      longitude: Number.isFinite(taken?.longitude) ? taken.longitude : null,
       mtimeMs: st.mtimeMs,
       size: st.size,
     };
@@ -605,7 +613,8 @@ function toPublicItem(item) {
     id: item.id,
     kind: item.kind,
     takenAt: item.takenAt,
-    place: item.place || null,
+    latitude: Number.isFinite(item.latitude) ? item.latitude : null,
+    longitude: Number.isFinite(item.longitude) ? item.longitude : null,
     thumbUrl: `/media/thumb/${item.id}?v=${version}`,
     viewUrl: `/media/view/${item.id}?v=${version}`,
     fileUrl: `/media/file/${item.id}?v=${version}`,
