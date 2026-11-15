@@ -194,7 +194,7 @@ function showGate(message) {
 }
 
 function header({ title, sub, back }) {
-  const head = el('header', 'head');
+  const head = el('header', back ? 'head is-sticky' : 'head');
   if (back) {
     const row = el('div', 'head-row');
     const button = el('button', 'back');
@@ -287,11 +287,8 @@ function paintHome() {
 
 function renderStream(album) {
   const page = el('main', 'page');
-  page.append(header({
-    title: album.title,
-    sub: `${countText(album)}。点开一张，左右接着看。`,
-    back: true,
-  }));
+  page.append(header({ title: album.title, back: true }));
+  page.append(el('p', 'sub album-lead', `${countText(album)}。点开一张，左右接着看。`));
   const grid = el('div', 'media-grid');
   album.items.forEach((item, index) => {
     const tile = el('button', 'tile');
