@@ -3,7 +3,15 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { embedJpegDate, embedJpegGps, readJpegTakenAt, scanLibrary, stableId } from '../server/library.js';
+import {
+  embedJpegDate,
+  embedJpegGps,
+  findEmbeddedMotion,
+  readJpegTakenAt,
+  readLiveMarkers,
+  scanLibrary,
+  stableId,
+} from '../server/library.js';
 
 test('jpeg exif date round-trips and prefers DateTimeOriginal', () => {
   const plain = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
@@ -91,6 +99,123 @@ test('a folder of files becomes one month, and occasions stay separate', async (
     assert.equal(lib.albums[2].kind, 'month');
     assert.deepEqual(lib.albums[2].items.map((item) => item.takenAt), ['2026-02-04', '2026-02-02']);
     assert.equal(lib.albums.some((album) => album.title === '全部'), false);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+function freeAtom(payload) {
+  const body = Buffer.concat([Buffer.from('free'), Buffer.from(payload)]);
+  const size = Buffer.alloc(4);
+  size.writeUInt32BE(body.length + 4);
+  return Buffer.concat([size, body]);
+}
+
+function liveClip({ stillTime = false, contentId = '' } = {}) {
+  const parts = [];
+  if (stillTime) parts.push('com.apple.quicktime.still-image-time');
+  if (contentId) parts.push(`com.apple.quicktime.content.identifier ${contentId}`);
+  return freeAtom(parts.join('\0'));
+}
+
+test('live photo markers and embedded motion are explicit', () => {
+  const id = 'B7E2C1A0-5D44-4F18-9A6E-0C1D2E3F4A5B';
+  const marked = readLiveMarkers(liveClip({ stillTime: true, contentId: id }));
+  assert.equal(marked.stillImageTime, true);
+  assert.equal(marked.contentId, id);
+  assert.equal(readLiveMarkers(Buffer.from('not a live photo')).stillImageTime, false);
+  assert.equal(readLiveMarkers(Buffer.from('not a live photo')).contentId, '');
+
+  const video = Buffer.alloc(40);
+  video.write('ftyp', 4);
+  const xmp = `<rdf:Description xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" GCamera:MicroVideo="1" GCamera:MicroVideoOffset="${video.length}" Item:Length="0"/>`;
+  const file = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.from(xmp), Buffer.from([0xff, 0xd9]), video]);
+  const found = findEmbeddedMotion(file);
+  assert.equal(found.length, video.length);
+  assert.equal(file.subarray(found.offset).equals(video), true);
+  assert.equal(findEmbeddedMotion(Buffer.concat([Buffer.from([0xff, 0xd8]), video])), null);
+  const flagged = Buffer.concat([
+    Buffer.from([0xff, 0xd8]),
+    Buffer.from('GCamera:MicroVideo="1" GCamera:MicroVideoOffset="40"'),
+    Buffer.from([0xff, 0xd9]),
+    Buffer.alloc(40, 1),
+  ]);
+  assert.equal(findEmbeddedMotion(flagged), null);
+});
+
+test('live photos pair a still with its motion clip and leave ordinary videos alone', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'family-media-live-'));
+  const id = 'B7E2C1A0-5D44-4F18-9A6E-0C1D2E3F4A5B';
+  const otherId = 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE';
+  try {
+    const jpeg = (name, extra = '') => fs.writeFile(
+      path.join(dir, name),
+      Buffer.concat([
+        embedJpegDate(Buffer.from([0xff, 0xd8, 0xff, 0xd9]), '2026-03-03'),
+        Buffer.from(extra),
+      ]),
+    );
+    await jpeg('plain.jpg');
+    await fs.writeFile(path.join(dir, 'movie.mp4'), Buffer.from('regular-video'));
+    await jpeg('twin.jpg');
+    await fs.writeFile(path.join(dir, 'twin.mp4'), Buffer.from('same-name-but-not-live'));
+    await jpeg('wave.jpg');
+    await fs.writeFile(path.join(dir, 'wave.mov'), liveClip({ stillTime: true }));
+    await fs.writeFile(path.join(dir, 'park.HEIC'), Buffer.from(`ContentIdentifier="${id}"`));
+    await fs.writeFile(path.join(dir, 'park.MOV'), liveClip({ contentId: id }));
+    await jpeg('other.jpg', `ContentIdentifier="${id}"`);
+    await fs.writeFile(path.join(dir, 'other.mov'), liveClip({ stillTime: true, contentId: otherId }));
+    await jpeg('tagged.jpg', `ContentIdentifier="${id}"`);
+    await fs.writeFile(path.join(dir, 'tagged.mp4'), Buffer.from('short-export-without-marker'));
+    await jpeg('huge.jpg', `ContentIdentifier="${id}"`);
+    const huge = path.join(dir, 'huge.mov');
+    await fs.writeFile(huge, Buffer.from('long-movie'));
+    await fs.truncate(huge, 41 * 1024 * 1024);
+    const video = Buffer.alloc(36);
+    video.write('ftyp', 4);
+    const motion = Buffer.concat([
+      Buffer.from([0xff, 0xd8]),
+      Buffer.from(`GCamera:MotionPhoto="1" Item:Length="0" Item:Length="${video.length}"`),
+      Buffer.from([0xff, 0xd9]),
+      video,
+    ]);
+    await fs.writeFile(path.join(dir, 'motion.jpg'), embedJpegDate(motion, '2026-03-03'));
+
+    const lib = await scanLibrary(dir);
+    const albumItems = lib.albums.flatMap((album) => album.items);
+    const byName = new Map([...lib.itemsById.values()].map((item) => [item.rel, item]));
+    const shown = new Set(albumItems.map((item) => item.id));
+    assert.equal(lib.albums.reduce((sum, album) => sum + album.photoCount, 0), 8);
+    assert.equal(lib.albums.reduce((sum, album) => sum + album.videoCount, 0), 4);
+    assert.equal(shown.has(byName.get('plain.jpg').id), true);
+    assert.equal(byName.get('plain.jpg').liveVideoId, undefined);
+    assert.equal(albumItems.find((item) => item.id === byName.get('plain.jpg').id).liveUrl, undefined);
+    assert.equal(shown.has(byName.get('movie.mp4').id), true);
+    assert.equal(shown.has(byName.get('twin.jpg').id), true);
+    assert.equal(shown.has(byName.get('twin.mp4').id), true);
+    assert.equal(byName.get('twin.jpg').liveVideoId, undefined);
+
+    const wave = byName.get('wave.jpg');
+    assert.equal(wave.liveVideoId, byName.get('wave.mov').id);
+    assert.equal(byName.get('wave.mov').liveMotion, true);
+    assert.equal(shown.has(byName.get('wave.mov').id), false);
+    assert.match(albumItems.find((item) => item.id === wave.id).liveUrl, /^\/media\/live\//);
+
+    const park = byName.get('park.HEIC');
+    assert.equal(park.liveVideoId, byName.get('park.MOV').id);
+    assert.equal(shown.has(byName.get('park.MOV').id), false);
+    assert.equal(byName.get('other.jpg').liveVideoId, undefined);
+    assert.equal(shown.has(byName.get('other.mov').id), true);
+    assert.equal(byName.get('tagged.jpg').liveVideoId, byName.get('tagged.mp4').id);
+    assert.equal(shown.has(byName.get('tagged.mp4').id), false);
+    assert.equal(byName.get('huge.jpg').liveVideoId, undefined);
+    assert.equal(shown.has(byName.get('huge.mov').id), true);
+
+    const embedded = byName.get('motion.jpg');
+    assert.equal(embedded.liveVideoId, undefined);
+    assert.equal(embedded.liveEmbedded.length, video.length);
+    assert.match(albumItems.find((item) => item.id === embedded.id).liveUrl, /^\/media\/live\//);
+    assert.equal(JSON.stringify(lib.albums).includes(dir), false);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

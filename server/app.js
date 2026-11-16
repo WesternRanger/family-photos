@@ -5,6 +5,7 @@ import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { cookieHeader, isAuthed, safeEqual } from './auth.js';
 import { createCatalog } from './catalog.js';
+import { liveTarget, mimeFor } from './library.js';
 import { addComment, changeLike } from './engagement.js';
 import { sendFile } from './send.js';
 import { detectTools, resolveMedia } from './thumbs.js';
@@ -13,6 +14,7 @@ const STATIC = new Map([
   ['/', 'index.html'],
   ['/index.html', 'index.html'],
   ['/app.js', 'app.js'],
+  ['/zoom.js', 'zoom.js'],
   ['/styles.css', 'styles.css'],
   ['/favicon.svg', 'favicon.svg'],
 ]);
@@ -165,7 +167,7 @@ export function createApp(config, { ttl = 60000, geocode } = {}) {
       return;
     }
 
-    const media = pathname.match(/^\/media\/(thumb|view|file)\/([a-f0-9]{16})$/);
+    const media = pathname.match(/^\/media\/(thumb|view|file|live)\/([a-f0-9]{16})$/);
     if (media) {
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         sendJson(req, res, 405, { error: 'method' });
@@ -186,6 +188,20 @@ export function createApp(config, { ttl = 60000, geocode } = {}) {
       const item = lib.itemsById.get(media[2]);
       if (!item) {
         sendJson(req, res, 404, { error: 'missing', message: '没有这张照片。' });
+        return;
+      }
+      if (media[1] === 'live') {
+        const target = liveTarget(item, lib.itemsById);
+        if (!target) {
+          sendJson(req, res, 404, { error: 'missing', message: '没有这段实况。' });
+          return;
+        }
+        const versioned = url.searchParams.has('v');
+        sendFile(req, res, target.abs, {
+          contentType: mimeFor(target.ext),
+          cacheControl: versioned ? 'public, max-age=31536000, immutable' : 'private, max-age=86400',
+          span: target.span,
+        });
         return;
       }
       const resolved = await resolveMedia(item, media[1], config);
