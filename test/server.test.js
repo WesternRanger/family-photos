@@ -107,7 +107,14 @@ test('library, thumbnails, and video byte ranges', async (t) => {
   assert.doesNotMatch(source, /img\.src = item\.fileUrl/);
   assert.doesNotMatch(source, /big-play/);
   assert.match(source, /video\.controls = true/);
+  assert.match(source, /video\.controls = false/);
   assert.match(source, /lockPageScroll/);
+  assert.match(source, /pinchTo/);
+  assert.match(source, /item\.liveUrl/);
+  assert.match(source, /播放实况/);
+  const zoomScript = await fetch(`${base}/zoom.js`);
+  assert.equal(zoomScript.status, 200);
+  assert.match(zoomScript.headers.get('content-type') || '', /javascript/);
 
   const ranged = await fetch(`${base}${video.fileUrl}`, { headers: { Range: 'bytes=0-9' } });
   assert.equal(ranged.status, 206);
@@ -263,4 +270,95 @@ test('demo media is ready to open', async () => {
   assert.ok(Math.abs(october.items[0].longitude - 121.47) < 0.02);
   assert.equal(october.items[0].place, undefined);
   assert.equal(JSON.stringify(october).includes('北纬'), false);
+  const live = all.filter((item) => item.liveUrl);
+  assert.equal(live.length, 1);
+  assert.equal(live[0].kind, 'photo');
+  assert.match(live[0].liveUrl, /^\/media\/live\//);
+  const motion = [...lib.itemsById.values()].filter((item) => item.liveMotion);
+  assert.equal(motion.length, 1);
+  assert.equal(motion[0].kind, 'video');
+  assert.equal(all.some((item) => item.id === motion[0].id), false);
+});
+
+test('live photo plays from the still and a plain photo has no motion route', async (t) => {
+  const { createCatalog } = await import('../server/catalog.js');
+  const { embedJpegDate } = await import('../server/library.js');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'family-media-live-http-'));
+  const media = path.join(dir, 'media');
+  const cache = path.join(dir, 'cache');
+  await fs.mkdir(media);
+  const clip = Buffer.from('free-live-clip-bytes-0123456789');
+  const marked = Buffer.concat([
+    Buffer.from('com.apple.quicktime.still-image-time\0'),
+    clip,
+  ]);
+  const video = Buffer.alloc(32, 0x2a);
+  video.write('ftyp', 4);
+  const embedded = Buffer.concat([
+    Buffer.from([0xff, 0xd8]),
+    Buffer.from(`GCamera:MicroVideo="1" GCamera:MicroVideoOffset="${video.length}"`),
+    Buffer.from([0xff, 0xd9]),
+    video,
+  ]);
+  await fs.writeFile(path.join(media, 'plain.jpg'), embedJpegDate(Buffer.from([0xff, 0xd8, 0xff, 0xd9]), '2026-05-01'));
+  await fs.writeFile(path.join(media, 'wave.jpg'), embedJpegDate(Buffer.from([0xff, 0xd8, 0xff, 0xd9]), '2026-05-02'));
+  await fs.writeFile(path.join(media, 'wave.mov'), marked);
+  await fs.writeFile(path.join(media, '散步.mp4'), Buffer.from('0123456789video'));
+  await fs.writeFile(path.join(media, 'motion.jpg'), embedJpegDate(embedded, '2026-05-03'));
+  const server = createApp({
+    root: rootDir,
+    host: '127.0.0.1',
+    port: 0,
+    mediaDir: media,
+    cacheDir: cache,
+    accessCode: '',
+    thumbSize: 120,
+    viewerSize: 160,
+    title: '荞荞的照片',
+  }, { ttl: 0 });
+  const port = await listen(server);
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const base = `http://127.0.0.1:${port}`;
+  const home = await (await fetch(`${base}/api/albums?offset=0&limit=3`)).json();
+  assert.equal(home.albums.reduce((sum, album) => sum + album.photoCount, 0), 3);
+  assert.equal(home.albums.reduce((sum, album) => sum + album.videoCount, 0), 1);
+  const albums = [];
+  for (const summary of home.albums) {
+    albums.push(await (await fetch(`${base}/api/album/${summary.id}`)).json());
+  }
+  const items = albums.flatMap((album) => album.items);
+  const plain = items.find((item) => item.takenAt === '2026-05-01');
+  const wave = items.find((item) => item.takenAt === '2026-05-02');
+  const motionItem = items.find((item) => item.takenAt === '2026-05-03');
+  const regular = items.find((item) => item.kind === 'video');
+  assert.equal(items.length, 4);
+  assert.equal(plain.liveUrl, undefined);
+  assert.match(wave.liveUrl, /^\/media\/live\//);
+  assert.match(motionItem.liveUrl, /^\/media\/live\//);
+  assert.equal(regular.liveUrl, undefined);
+  const played = await fetch(`${base}${wave.liveUrl}`);
+  assert.equal(played.status, 200);
+  assert.equal(played.headers.get('content-type'), 'video/quicktime');
+  assert.equal(Buffer.from(await played.arrayBuffer()).equals(marked), true);
+  const ranged = await fetch(`${base}${wave.liveUrl}`, { headers: { Range: 'bytes=0-3' } });
+  assert.equal(ranged.status, 206);
+  assert.equal(Buffer.from(await ranged.arrayBuffer()).toString(), marked.subarray(0, 4).toString());
+  const embeddedRes = await fetch(`${base}${motionItem.liveUrl}`);
+  assert.equal(embeddedRes.status, 200);
+  assert.equal(embeddedRes.headers.get('content-type'), 'video/mp4');
+  assert.equal(Buffer.from(await embeddedRes.arrayBuffer()).equals(video), true);
+  const noMotion = await fetch(`${base}/media/live/${plain.id}`);
+  assert.equal(noMotion.status, 404);
+  const catalog = createCatalog(media, { ttl: 0, cacheDir: cache });
+  const may = home.albums.find((album) => album.photoCount === 3);
+  const again = await catalog.album(may.id);
+  assert.equal(catalog.stats.scans, 0);
+  assert.match(again.items.find((item) => item.takenAt === '2026-05-02').liveUrl, /^\/media\/live\//);
+  assert.equal(again.items.find((item) => item.takenAt === '2026-05-01').liveUrl, undefined);
+  assert.equal(again.videoCount, 0);
+  const november = await catalog.album(home.albums.find((album) => album.videoCount === 1).id);
+  assert.equal(november.items.some((item) => item.kind === 'video'), true);
 });

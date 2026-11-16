@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { engagementSummary } from './engagement.js';
-import { computeStamp, scanLibrary } from './library.js';
+import { computeStamp, publicLiveUrl, scanLibrary } from './library.js';
 import { cleanPlace, createGeocoder } from './places.js';
 
 const PAGE = 3;
@@ -106,6 +106,9 @@ function hydrate(rootReal, data) {
       size: raw.size,
       likes: raw.likes || 0,
       commentCount: raw.commentCount || 0,
+      liveVideoId: /^[a-f0-9]{16}$/.test(raw.liveVideoId || '') ? raw.liveVideoId : undefined,
+      liveEmbedded: liveSpan(raw.liveEmbedded),
+      liveMotion: raw.liveMotion === true ? true : undefined,
       abs: path.join(rootReal, ...rel.split('/')),
     });
   }
@@ -121,6 +124,15 @@ function hydrate(rootReal, data) {
   return { mode: 'albums', albums, itemsById };
 }
 
+function liveSpan(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  const offset = value.offset;
+  const length = value.length;
+  if (!Number.isInteger(offset) || !Number.isInteger(length)) return undefined;
+  if (offset < 0 || length < 32 || length > 80 * 1024 * 1024) return undefined;
+  return { offset, length };
+}
+
 function coord(value, limit) {
   const n = Number(value);
   if (!Number.isFinite(n) || Math.abs(n) > limit) return null;
@@ -129,7 +141,7 @@ function coord(value, limit) {
 
 function serialize(lib, stamp) {
   return {
-    schema: 2,
+    schema: 3,
     stamp,
     albums: lib.albums.map((album) => ({
       id: album.id,
@@ -154,6 +166,9 @@ function serialize(lib, stamp) {
       size: item.size,
       likes: item.likes || 0,
       commentCount: item.commentCount || 0,
+      liveVideoId: item.liveVideoId || undefined,
+      liveEmbedded: item.liveEmbedded || undefined,
+      liveMotion: item.liveMotion === true ? true : undefined,
     })),
   };
 }
@@ -210,7 +225,7 @@ async function publicAlbum(lib, id, geocoder) {
   ]);
   const items = raw.map((item, index) => {
     const saved = savedList[index];
-    return {
+    const row = {
       id: item.id,
       kind: item.kind,
       takenAt: item.takenAt,
@@ -222,6 +237,10 @@ async function publicAlbum(lib, id, geocoder) {
       viewUrl: `/media/view/${item.id}?v=${Math.round(item.mtimeMs)}`,
       fileUrl: fileUrl(item),
     };
+    const motion = publicLiveUrl(item);
+    const partner = item.liveVideoId ? lib.itemsById.get(item.liveVideoId) : null;
+    if (motion && (item.liveEmbedded || partner?.liveMotion)) row.liveUrl = motion;
+    return row;
   });
   return {
     id: album.id,
@@ -247,7 +266,7 @@ export function createCatalog(mediaDir, { ttl = 3000, cacheDir, geocode } = {}) 
     if (!indexPath) return null;
     try {
       const data = JSON.parse(await fs.readFile(indexPath, 'utf8'));
-      if (!data || data.schema !== 2 || typeof data.stamp !== 'string' || !Array.isArray(data.albums) || !Array.isArray(data.items)) return null;
+      if (!data || data.schema !== 3 || typeof data.stamp !== 'string' || !Array.isArray(data.albums) || !Array.isArray(data.items)) return null;
       return data;
     } catch {
       return null;

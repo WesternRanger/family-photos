@@ -40,6 +40,226 @@ export function mimeFor(ext) {
   return MIME[ext] || 'application/octet-stream';
 }
 
+const LIVE_VIDEO_EXT = new Set(['.mov', '.mp4', '.m4v']);
+const LIVE_HARD_MAX = 80 * 1024 * 1024;
+const LIVE_SOFT_MAX = 40 * 1024 * 1024;
+const LIVE_STILL_TIME = 'com.apple.quicktime.still-image-time';
+const LIVE_CONTENT_KEY = 'com.apple.quicktime.content.identifier';
+const UUID_RE = /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/;
+const STILL_RANK = new Map([
+  ['.heic', 0], ['.heif', 1], ['.jpg', 2], ['.jpeg', 3], ['.png', 4],
+  ['.webp', 5], ['.tif', 6], ['.tiff', 7], ['.bmp', 8], ['.gif', 9],
+]);
+
+function stemKey(rel) {
+  const ext = path.posix.extname(rel);
+  const base = path.posix.basename(rel, ext).toLowerCase();
+  const dir = path.posix.dirname(rel);
+  const folder = dir === '.' ? '' : dir.toLowerCase();
+  return `${folder}/${base}`;
+}
+
+function stillRank(item) {
+  return STILL_RANK.get(item.ext) ?? 20;
+}
+
+function videoRank(item) {
+  if (item.ext === '.mov') return 0;
+  if (item.ext === '.mp4') return 1;
+  if (item.ext === '.m4v') return 2;
+  return 3;
+}
+
+async function readSlice(abs, size, head, tail = 0) {
+  const handle = await fs.open(abs, 'r');
+  try {
+    const headLen = Math.min(Math.max(size, 0), head);
+    const headBuf = Buffer.alloc(headLen);
+    if (headLen) await handle.read(headBuf, 0, headLen, 0);
+    if (!tail || size <= headLen) return headBuf;
+    const tailLen = Math.min(tail, size - headLen);
+    const tailBuf = Buffer.alloc(tailLen);
+    await handle.read(tailBuf, 0, tailLen, size - tailLen);
+    return Buffer.concat([headBuf, tailBuf]);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readAt(abs, start, length) {
+  const handle = await fs.open(abs, 'r');
+  try {
+    const buf = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buf, 0, length, start);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+function contentIdNear(text, key) {
+  const at = text.indexOf(key);
+  if (at < 0) return '';
+  const slice = text.slice(Math.max(0, at - 80), at + 4096);
+  const found = UUID_RE.exec(slice);
+  return found ? found[0].toUpperCase() : '';
+}
+
+export function readLiveMarkers(buffer) {
+  const text = Buffer.isBuffer(buffer) ? buffer.toString('latin1') : '';
+  const stillImageTime = text.includes(LIVE_STILL_TIME);
+  let contentId = contentIdNear(text, LIVE_CONTENT_KEY);
+  if (!contentId) {
+    const xmp = /ContentIdentifier[^0-9A-Fa-f]{0,12}([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})/.exec(text);
+    if (xmp) contentId = xmp[1].toUpperCase();
+  }
+  return { stillImageTime, contentId };
+}
+
+export function embeddedMotionCandidates(buffer, fileSize = buffer?.length || 0) {
+  if (!buffer || fileSize < 64) return [];
+  const text = buffer.subarray(0, Math.min(buffer.length, 131072)).toString('latin1');
+  if (!/(?:MicroVideo|MotionPhoto)(?:=["']|>)\s*1\b/.test(text)) return [];
+  const lengths = [];
+  const off = /MicroVideoOffset(?:=["']|>)\s*(\d+)/.exec(text);
+  if (off) lengths.push(Number(off[1]));
+  const re = /Item:Length(?:=["']|>)\s*(\d+)/g;
+  let match;
+  while ((match = re.exec(text))) lengths.push(Number(match[1]));
+  const candidates = [];
+  const seen = new Set();
+  for (const length of lengths) {
+    if (!Number.isInteger(length) || length < 32 || length >= fileSize || seen.has(length)) continue;
+    seen.add(length);
+    const offset = fileSize - length;
+    if (offset < 0) continue;
+    if (offset + 8 <= buffer.length && buffer.toString('ascii', offset + 4, offset + 8) !== 'ftyp') continue;
+    candidates.push({ offset, length });
+  }
+  return candidates;
+}
+
+export function findEmbeddedMotion(buffer, fileSize = buffer?.length || 0) {
+  const candidates = embeddedMotionCandidates(buffer, fileSize);
+  return candidates.find((candidate) => (
+    candidate.offset + 8 <= buffer.length
+    && buffer.toString('ascii', candidate.offset + 4, candidate.offset + 8) === 'ftyp'
+  )) || null;
+}
+
+function pairMatches(still, video, size) {
+  if (!still || !video) return false;
+  if (still.contentId && video.contentId && still.contentId !== video.contentId) return false;
+  if (video.stillImageTime || video.contentId) return true;
+  if (still.contentId && size <= LIVE_SOFT_MAX) return true;
+  return false;
+}
+
+function chooseStill(photos, signals, videoSignals) {
+  if (videoSignals.contentId) {
+    const match = photos.find((photo) => signals.get(photo.id)?.contentId === videoSignals.contentId);
+    if (match) return match;
+  }
+  const ranked = photos.slice().sort((a, b) => stillRank(a) - stillRank(b) || a.rel.localeCompare(b.rel, 'zh'));
+  if (!videoSignals.contentId) {
+    const tagged = ranked.find((photo) => signals.get(photo.id)?.contentId);
+    if (tagged) return tagged;
+  }
+  return ranked[0] || null;
+}
+
+async function pairGroup(photos, videos) {
+  const ranked = [];
+  for (const video of videos) {
+    ranked.push({ video, signals: readLiveMarkers(await readSlice(video.abs, video.size, 2 * 1024 * 1024, 2 * 1024 * 1024)) });
+  }
+  ranked.sort((a, b) => {
+    const score = (signals) => (signals.stillImageTime ? 2 : 0) + (signals.contentId ? 1 : 0);
+    return score(b.signals) - score(a.signals) || videoRank(a.video) - videoRank(b.video);
+  });
+  const signals = new Map();
+  for (const photo of photos) {
+    signals.set(photo.id, readLiveMarkers(await readSlice(photo.abs, photo.size, 262144, 0)));
+  }
+  for (const candidate of ranked) {
+    const still = chooseStill(photos, signals, candidate.signals);
+    if (!still) continue;
+    if (!pairMatches(signals.get(still.id), candidate.signals, candidate.video.size)) continue;
+    still.liveVideoId = candidate.video.id;
+    candidate.video.liveMotion = true;
+    return;
+  }
+}
+
+async function readEmbeddedFile(photo) {
+  const head = await readSlice(photo.abs, photo.size, 131072, 0);
+  const candidates = embeddedMotionCandidates(head, photo.size);
+  for (const candidate of candidates) {
+    let probe = null;
+    if (candidate.offset + 8 <= head.length) probe = head.subarray(candidate.offset, candidate.offset + 12);
+    else probe = await readAt(photo.abs, candidate.offset, 12);
+    if (probe.length >= 8 && probe.toString('ascii', 4, 8) === 'ftyp') return candidate;
+  }
+  return null;
+}
+
+// Same-name still + short video from an iPhone Live Photo export.
+// The motion file is kept for playback and left out of the album.
+async function attachLivePhotos(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const key = stemKey(item.rel);
+    const list = groups.get(key);
+    if (list) list.push(item);
+    else groups.set(key, [item]);
+  }
+  const pairs = [];
+  for (const group of groups.values()) {
+    const photos = group.filter((item) => item.kind === 'photo');
+    const videos = group.filter((item) => item.kind === 'video' && LIVE_VIDEO_EXT.has(item.ext) && item.size > 0 && item.size <= LIVE_HARD_MAX);
+    if (photos.length && videos.length) pairs.push({ photos, videos });
+  }
+  await mapPool(pairs, 4, async ({ photos, videos }) => {
+    try {
+      await pairGroup(photos, videos);
+    } catch {
+      /* leave the files as an ordinary still and video */
+    }
+  });
+  const jpegs = items.filter((item) => (
+    item.kind === 'photo'
+    && !item.liveVideoId
+    && (item.ext === '.jpg' || item.ext === '.jpeg')
+  ));
+  await mapPool(jpegs, 8, async (photo) => {
+    try {
+      const embedded = await readEmbeddedFile(photo);
+      if (embedded) photo.liveEmbedded = embedded;
+    } catch {
+      /* ordinary still */
+    }
+  });
+}
+
+export function publicLiveUrl(item) {
+  if (!item || (!item.liveVideoId && !item.liveEmbedded)) return '';
+  return `/media/live/${item.id}?v=${Math.round(item.mtimeMs)}`;
+}
+
+export function liveTarget(item, itemsById) {
+  if (!item) return null;
+  if (item.liveVideoId) {
+    const video = itemsById?.get(item.liveVideoId);
+    if (!video?.abs || video.liveMotion !== true || video.kind !== 'video') return null;
+    return { abs: video.abs, ext: video.ext };
+  }
+  const span = item.liveEmbedded;
+  if (!span || !item.abs) return null;
+  const { offset, length } = span;
+  if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 32) return null;
+  return { abs: item.abs, ext: '.mp4', span: { start: offset, end: offset + length - 1 } };
+}
+
 export function stableId(value) {
   return crypto.createHash('sha1').update(value).digest('hex').slice(0, 16);
 }
@@ -609,7 +829,7 @@ async function makeAlbum({ id, title, kind, items, stories, rank = 0 }) {
 
 function toPublicItem(item) {
   const version = Math.round(item.mtimeMs);
-  return {
+  const publicItem = {
     id: item.id,
     kind: item.kind,
     takenAt: item.takenAt,
@@ -619,6 +839,9 @@ function toPublicItem(item) {
     viewUrl: `/media/view/${item.id}?v=${version}`,
     fileUrl: `/media/file/${item.id}?v=${version}`,
   };
+  const motion = publicLiveUrl(item);
+  if (motion) publicItem.liveUrl = motion;
+  return publicItem;
 }
 
 function toPublicAlbum(album) {
@@ -666,7 +889,9 @@ export async function scanLibrary(mediaDir) {
   }
 
   const items = await collectFiles(rootReal, rootReal);
-  const stories = await collectStories(rootReal, items);
+  await attachLivePhotos(items);
+  const visible = items.filter((item) => !item.liveMotion);
+  const stories = await collectStories(rootReal, visible);
   const top = await fs.readdir(rootReal, { withFileTypes: true });
   const occasions = [];
   for (const entry of top) {
@@ -693,7 +918,7 @@ export async function scanLibrary(mediaDir) {
   const albums = [];
   const occasionAlbums = [];
   for (const dir of occasions) {
-    const group = items.filter((item) => item.rel === dir.name || item.rel.startsWith(`${dir.name}/`));
+    const group = visible.filter((item) => item.rel === dir.name || item.rel.startsWith(`${dir.name}/`));
     if (group.length === 0) continue;
     occasionAlbums.push(await makeAlbum({
       id: stableId(`occasion:${dir.name}`),
@@ -708,7 +933,7 @@ export async function scanLibrary(mediaDir) {
   albums.push(...occasionAlbums);
 
   const byMonth = new Map();
-  for (const item of items) {
+  for (const item of visible) {
     if (inOccasion(item)) continue;
     const key = String(item.takenAt || '').slice(0, 7);
     if (!/^\d{4}-\d{2}$/.test(key)) continue;

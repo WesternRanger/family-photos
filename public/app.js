@@ -1,3 +1,5 @@
+import { isZoomed, panBy, pinchTo } from './zoom.js';
+
 const app = document.querySelector('#app');
 const theme = document.querySelector('meta[name="theme-color"]');
 
@@ -24,6 +26,8 @@ let placeToken = 0;
 let savedScroll = 0;
 let scrollLocked = false;
 const warmed = new Set();
+let resetZoom = () => {};
+let liveToken = 0;
 
 function wrap(index, count) {
   if (count <= 0) return 0;
@@ -434,6 +438,8 @@ function unlockPageScroll() {
 
 function closeViewer() {
   if (!viewerEl) return;
+  stopLive();
+  resetZoom();
   viewerEl.querySelectorAll('video').forEach((video) => video.pause());
   viewerEl.remove();
   viewerEl = null;
@@ -803,6 +809,8 @@ function placeSlides(track, indexes, count, dir) {
 }
 
 function paintViewer(index, { dir = 0 } = {}) {
+  stopLive();
+  resetZoom();
   const count = viewerItems.length;
   const previous = viewerEl.dataset.index;
   viewerIndex = wrap(index, count);
@@ -820,6 +828,13 @@ function paintViewer(index, { dir = 0 } = {}) {
   track.style.transform = 'translate3d(-33.333333%, 0, 0)';
   const item = viewerItems[viewerIndex];
   viewerEl.classList.toggle('is-video', item?.kind === 'video');
+  const showLive = item?.kind === 'photo' && Boolean(item.liveUrl);
+  viewerEl.classList.toggle('has-live', showLive);
+  const liveBtn = viewerEl.querySelector('.live-play');
+  if (liveBtn) {
+    liveBtn.hidden = !showLive;
+    if (!showLive) liveBtn.setAttribute('aria-pressed', 'false');
+  }
   viewerEl.querySelector('.viewer-count').textContent = count ? `${viewerIndex + 1} / ${count}` : '';
   viewerEl.querySelector('.viewer-date').textContent = formatWhen(item);
   fillPlace(item);
@@ -833,7 +848,8 @@ function paintViewer(index, { dir = 0 } = {}) {
 
 function shiftViewer(dir) {
   const count = viewerItems.length;
-  if (count < 2 || viewerBusy) return;
+  if (count < 2 || viewerBusy || viewerEl?.classList.contains('is-zoomed')) return;
+  stopLive();
   const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   dismissHint();
   viewerEl.querySelectorAll('video').forEach((video) => video.pause());
@@ -885,69 +901,245 @@ function dismissHint() {
   try { sessionStorage.setItem('family-media-hint', '1'); } catch { /* private mode */ }
 }
 
-function bindViewerGestures(stage) {
-  let pointerId = null;
-  let startX = 0;
-  let startY = 0;
-  let dx = 0;
-  let axis = null;
-  let fromVideo = false;
-  let armed = false;
+function stopLive() {
+  liveToken += 1;
+  if (!viewerEl) return;
+  viewerEl.querySelectorAll('video.live').forEach((video) => {
+    video.pause();
+    video.classList.remove('is-playing');
+    video.removeAttribute('src');
+    video.remove();
+  });
+  const button = viewerEl.querySelector('.live-play');
+  if (button) button.setAttribute('aria-pressed', 'false');
+}
 
-  const arm = (event) => {
-    if (armed) return;
-    armed = true;
-    if (fromVideo) {
-      stage.setPointerCapture(event.pointerId);
-      event.preventDefault();
+async function playLive() {
+  const item = viewerItems[viewerIndex];
+  if (!item?.liveUrl || item.kind !== 'photo' || !viewerEl) return;
+  const frame = viewerEl.querySelector('.track')?.children[1]?.querySelector('.frame');
+  if (!frame) return;
+  stopLive();
+  resetZoom();
+  const token = liveToken;
+  const video = document.createElement('video');
+  video.className = 'original live';
+  video.playsInline = true;
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
+  video.controls = false;
+  video.loop = false;
+  video.preload = 'auto';
+  video.muted = false;
+  video.setAttribute('aria-label', '实况');
+  frame.append(video);
+  const button = viewerEl.querySelector('.live-play');
+  button?.setAttribute('aria-pressed', 'true');
+  let settled = false;
+  const finish = () => {
+    if (settled || token !== liveToken) return;
+    settled = true;
+    video.pause();
+    video.classList.remove('is-playing');
+    if (button?.isConnected) button.setAttribute('aria-pressed', 'false');
+    video.remove();
+  };
+  video.addEventListener('ended', finish);
+  video.addEventListener('error', finish);
+  video.src = item.liveUrl;
+  const start = async () => {
+    await video.play();
+    if (!video.isConnected || settled || token !== liveToken) return;
+    video.classList.add('is-playing');
+  };
+  try {
+    await start();
+  } catch {
+    video.muted = true;
+    try {
+      await start();
+    } catch {
+      finish();
     }
+  }
+}
+
+function bindViewerGestures(stage) {
+  let mode = null;
+  let zoom = { scale: 1, x: 0, y: 0 };
+  let pinchStart = null;
+  let panStart = null;
+  let swipe = null;
+
+  const frameOf = () => viewerEl?.querySelector('.track')?.children[1]?.querySelector('.frame') || null;
+
+  const boxOf = () => {
+    const slide = viewerEl?.querySelector('.track')?.children[1];
+    const rect = slide?.getBoundingClientRect();
+    return {
+      left: rect?.left || 0,
+      top: rect?.top || 0,
+      width: rect?.width || stage.clientWidth || 1,
+      height: rect?.height || stage.clientHeight || 1,
+    };
   };
 
-  stage.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0 || viewerItems.length < 2 || viewerBusy) return;
-    if (event.target.closest('button, a, input, .viewer-actions, .viewer-bar')) return;
-    const video = event.target.closest('video');
-    if (video) {
-      const rect = video.getBoundingClientRect();
-      if (rect.bottom - event.clientY < 120) return;
+  const applyZoom = () => {
+    const frame = frameOf();
+    viewerEl?.classList.toggle('is-zoomed', zoom.scale > 1);
+    if (!frame) return;
+    if (!(zoom.scale > 1)) {
+      frame.style.transform = '';
+      frame.style.transformOrigin = '';
+      return;
     }
-    pointerId = event.pointerId;
-    startX = event.clientX;
-    startY = event.clientY;
-    dx = 0;
-    axis = null;
-    fromVideo = Boolean(video);
-    armed = !fromVideo;
-    if (!fromVideo) {
-      stage.setPointerCapture(event.pointerId);
-      event.preventDefault();
-    }
-  }, true);
+    frame.style.transformOrigin = '0 0';
+    frame.style.transform = `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.scale})`;
+  };
 
-  stage.addEventListener('pointermove', (event) => {
-    if (event.pointerId !== pointerId) return;
-    dx = event.clientX - startX;
-    const dy = event.clientY - startY;
-    if (!axis) {
-      if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
-      axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
-      if (axis === 'x') arm(event);
-      else if (fromVideo) {
-        pointerId = null;
+  const settleZoom = () => {
+    if (!isZoomed(zoom.scale)) resetZoom();
+    else applyZoom();
+  };
+
+  resetZoom = () => {
+    zoom = { scale: 1, x: 0, y: 0 };
+    pinchStart = null;
+    panStart = null;
+    viewerEl?.classList.remove('is-zoomed');
+    viewerEl?.querySelectorAll('.frame').forEach((frame) => {
+      frame.style.transform = '';
+      frame.style.transformOrigin = '';
+    });
+  };
+
+  const photoOpen = () => viewerItems[viewerIndex]?.kind === 'photo';
+
+  const blockedTarget = (target) => Boolean(target?.closest?.('button, a, input, .viewer-actions, .viewer-bar, .comment-sheet'));
+
+  const nativeVideo = (target) => {
+    const video = target?.closest?.('video');
+    if (!video || video.classList.contains('live')) return null;
+    return video;
+  };
+
+  const inVideoControls = (video, clientY) => {
+    if (!video) return false;
+    const rect = video.getBoundingClientRect();
+    return rect.bottom - clientY < 120;
+  };
+
+  const centerTrack = () => {
+    const track = viewerEl?.querySelector('.track');
+    if (!track) return;
+    track.style.transition = 'none';
+    track.style.transform = 'translate3d(-33.333333%, 0, 0)';
+  };
+
+  const beginPinch = (a, b) => {
+    mode = 'pinch';
+    swipe = null;
+    centerTrack();
+    const box = boxOf();
+    pinchStart = {
+      scale: zoom.scale,
+      x: zoom.x,
+      y: zoom.y,
+      dist: Math.max(Math.hypot(a.x - b.x, a.y - b.y), 1),
+      mid: { x: (a.x + b.x) / 2 - box.left, y: (a.y + b.y) / 2 - box.top },
+    };
+  };
+
+  const movePinch = (a, b) => {
+    if (!pinchStart) return;
+    const box = boxOf();
+    zoom = pinchTo({
+      startScale: pinchStart.scale,
+      startX: pinchStart.x,
+      startY: pinchStart.y,
+      startDist: pinchStart.dist,
+      startMid: pinchStart.mid,
+      mid: { x: (a.x + b.x) / 2 - box.left, y: (a.y + b.y) / 2 - box.top },
+      dist: Math.hypot(a.x - b.x, a.y - b.y),
+      width: box.width,
+      height: box.height,
+    });
+    applyZoom();
+  };
+
+  const beginPan = (x, y) => {
+    mode = 'pan';
+    swipe = null;
+    panStart = { x: zoom.x, y: zoom.y, px: x, py: y };
+  };
+
+  const movePan = (x, y) => {
+    if (!panStart) return;
+    const box = boxOf();
+    zoom = panBy({
+      startX: panStart.x,
+      startY: panStart.y,
+      dx: x - panStart.px,
+      dy: y - panStart.py,
+      scale: zoom.scale,
+      width: box.width,
+      height: box.height,
+    });
+    applyZoom();
+  };
+
+  const beginSwipe = (x, y, fromVideo) => {
+    if (viewerItems.length < 2) {
+      mode = null;
+      return;
+    }
+    mode = 'swipe';
+    swipe = {
+      startX: x,
+      startY: y,
+      dx: 0,
+      axis: null,
+      fromVideo,
+      armed: !fromVideo,
+    };
+  };
+
+  const moveSwipe = (x, y, event) => {
+    if (!swipe) return;
+    swipe.dx = x - swipe.startX;
+    const dy = y - swipe.startY;
+    if (!swipe.axis) {
+      if (Math.abs(swipe.dx) < 10 && Math.abs(dy) < 10) return;
+      swipe.axis = Math.abs(swipe.dx) > Math.abs(dy) ? 'x' : 'y';
+      if (swipe.axis === 'x' && swipe.fromVideo && !swipe.armed) {
+        swipe.armed = true;
+        if (event?.pointerId != null && event.pointerType !== 'touch') {
+          try { stage.setPointerCapture(event.pointerId); } catch { /* pointer already ended */ }
+        }
+        if (event?.cancelable) event.preventDefault();
+      } else if (swipe.axis === 'y' && swipe.fromVideo) {
+        mode = null;
+        swipe = null;
         return;
       }
     }
-    if (!armed || axis !== 'x') return;
+    if (!swipe.armed || swipe.axis !== 'x') return;
+    if (event?.cancelable) event.preventDefault();
     const width = stage.clientWidth || 1;
-    const percent = -33.333333 + (dx / width) * 33.333333;
+    const percent = -33.333333 + (swipe.dx / width) * 33.333333;
     const track = viewerEl.querySelector('.track');
     track.style.transition = 'none';
     track.style.transform = `translate3d(${percent}%, 0, 0)`;
-  });
+  };
 
-  const end = (event) => {
-    if (event.pointerId !== pointerId) return;
-    pointerId = null;
+  const endSwipe = () => {
+    if (!swipe) {
+      mode = null;
+      return;
+    }
+    const { dx, axis } = swipe;
+    mode = null;
+    swipe = null;
     const width = stage.clientWidth || 1;
     const threshold = Math.max(48, width * 0.18);
     if (axis === 'x' && dx <= -threshold) shiftViewer(1);
@@ -957,10 +1149,120 @@ function bindViewerGestures(stage) {
       track.style.transition = 'transform 220ms ease';
       track.style.transform = 'translate3d(-33.333333%, 0, 0)';
     }
-    axis = null;
   };
-  stage.addEventListener('pointerup', end);
-  stage.addEventListener('pointercancel', end);
+
+  const finishFingers = (count, x, y) => {
+    if (mode === 'pinch') {
+      if (count >= 2) return;
+      if (count === 1 && zoom.scale > 1) {
+        beginPan(x, y);
+        return;
+      }
+      mode = null;
+      settleZoom();
+      return;
+    }
+    if (mode === 'pan') {
+      if (count > 0) return;
+      mode = null;
+      panStart = null;
+      settleZoom();
+      return;
+    }
+    if (mode === 'swipe') endSwipe();
+  };
+
+  stage.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'touch' || event.button !== 0 || viewerBusy || mode) return;
+    if (blockedTarget(event.target)) return;
+    const video = nativeVideo(event.target);
+    if (inVideoControls(video, event.clientY)) return;
+    if (photoOpen() && zoom.scale > 1) {
+      beginPan(event.clientX, event.clientY);
+      try { stage.setPointerCapture(event.pointerId); } catch { /* pointer already ended */ }
+      event.preventDefault();
+      return;
+    }
+    beginSwipe(event.clientX, event.clientY, Boolean(video));
+    if (!video && mode === 'swipe') {
+      try { stage.setPointerCapture(event.pointerId); } catch { /* pointer already ended */ }
+      event.preventDefault();
+    }
+  }, true);
+
+  stage.addEventListener('pointermove', (event) => {
+    if (event.pointerType === 'touch') return;
+    if (mode === 'pan') {
+      movePan(event.clientX, event.clientY);
+      event.preventDefault();
+      return;
+    }
+    if (mode === 'swipe') moveSwipe(event.clientX, event.clientY, event);
+  });
+
+  const endPointer = (event) => {
+    if (event.pointerType === 'touch') return;
+    finishFingers(0, event.clientX, event.clientY);
+  };
+  stage.addEventListener('pointerup', endPointer);
+  stage.addEventListener('pointercancel', endPointer);
+
+  stage.addEventListener('touchstart', (event) => {
+    if (viewerBusy) return;
+    if (blockedTarget(event.target)) return;
+    const video = nativeVideo(event.target);
+    const touch = event.changedTouches[0];
+    if (!touch) return;
+    if (inVideoControls(video, touch.clientY) && event.touches.length < 2) return;
+    if (event.touches.length >= 2 && photoOpen()) {
+      const a = event.touches[0];
+      const b = event.touches[1];
+      beginPinch({ x: a.clientX, y: a.clientY }, { x: b.clientX, y: b.clientY });
+      if (event.cancelable) event.preventDefault();
+      return;
+    }
+    if (event.touches.length !== 1) return;
+    if (photoOpen() && zoom.scale > 1) {
+      beginPan(touch.clientX, touch.clientY);
+      if (event.cancelable) event.preventDefault();
+      return;
+    }
+    beginSwipe(touch.clientX, touch.clientY, Boolean(video));
+    if (!video && mode === 'swipe' && event.cancelable) event.preventDefault();
+  }, { passive: false });
+
+  stage.addEventListener('touchmove', (event) => {
+    if (mode === 'pinch' && event.touches.length >= 2) {
+      const a = event.touches[0];
+      const b = event.touches[1];
+      movePinch({ x: a.clientX, y: a.clientY }, { x: b.clientX, y: b.clientY });
+      if (event.cancelable) event.preventDefault();
+      return;
+    }
+    if (mode === 'pan' && event.touches.length >= 1) {
+      const touch = event.touches[0];
+      movePan(touch.clientX, touch.clientY);
+      if (event.cancelable) event.preventDefault();
+      return;
+    }
+    if (mode === 'swipe' && event.touches.length === 1) {
+      const touch = event.touches[0];
+      moveSwipe(touch.clientX, touch.clientY, event);
+    }
+  }, { passive: false });
+
+  const endTouch = (event) => {
+    const touch = event.changedTouches[0];
+    finishFingers(event.touches.length, touch?.clientX || 0, touch?.clientY || 0);
+  };
+  stage.addEventListener('touchend', endTouch);
+  stage.addEventListener('touchcancel', endTouch);
+
+  const blockBrowserPinch = (event) => {
+    if (event.cancelable) event.preventDefault();
+  };
+  viewerEl.addEventListener('gesturestart', blockBrowserPinch, { passive: false });
+  viewerEl.addEventListener('gesturechange', blockBrowserPinch, { passive: false });
 }
 
 function openViewer(album, index) {
@@ -1008,6 +1310,15 @@ function openViewer(album, index) {
       viewerEl.querySelector('.comment-sheet').hidden = false;
     });
     actions.append(like, openComments);
+    const live = el('button', 'live-play');
+    live.type = 'button';
+    live.hidden = true;
+    live.setAttribute('aria-pressed', 'false');
+    live.setAttribute('aria-label', '播放实况');
+    const mark = el('span', 'live-mark');
+    mark.setAttribute('aria-hidden', 'true');
+    live.append(mark, document.createTextNode('播放实况'));
+    live.addEventListener('click', () => { playLive(); });
     const sheet = el('section', 'comment-sheet');
     sheet.hidden = true;
     sheet.setAttribute('aria-label', '留言');
@@ -1056,7 +1367,7 @@ function openViewer(album, index) {
       sendComment();
     });
     sheet.append(sheetBar, el('div', 'comment-list'), grid, form);
-    viewerEl.append(stage, bar, prev, next, actions, sheet);
+    viewerEl.append(stage, bar, prev, next, live, actions, sheet);
     let seen = false;
     try { seen = sessionStorage.getItem('family-media-hint') === '1'; } catch { seen = false; }
     if (!seen && album.items.length > 1) {
@@ -1123,12 +1434,10 @@ window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     event.preventDefault();
     leaveViewer();
-  } else if (event.key === 'ArrowRight') {
+  } else if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+    if (viewerEl.classList.contains('is-zoomed')) return;
     event.preventDefault();
-    shiftViewer(1);
-  } else if (event.key === 'ArrowLeft') {
-    event.preventDefault();
-    shiftViewer(-1);
+    shiftViewer(event.key === 'ArrowRight' ? 1 : -1);
   }
 });
 

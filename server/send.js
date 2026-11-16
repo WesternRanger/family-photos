@@ -31,7 +31,7 @@ function bind(stream, res) {
   stream.pipe(res);
 }
 
-export function sendFile(req, res, absPath, { contentType, cacheControl }) {
+export function sendFile(req, res, absPath, { contentType, cacheControl, span } = {}) {
   let stat;
   try {
     stat = fs.statSync(absPath);
@@ -46,8 +46,22 @@ export function sendFile(req, res, absPath, { contentType, cacheControl }) {
     return;
   }
 
-  const size = stat.size;
-  const etag = `"${Math.round(stat.mtimeMs).toString(16)}-${size.toString(16)}"`;
+  let offset = 0;
+  let size = stat.size;
+  if (span) {
+    const start = span.start;
+    const end = span.end;
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= stat.size) {
+      res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
+      res.end(JSON.stringify({ error: 'missing' }));
+      return;
+    }
+    offset = start;
+    size = end - start + 1;
+  }
+  const etag = span
+    ? `"${Math.round(stat.mtimeMs).toString(16)}-${size.toString(16)}-${offset.toString(16)}"`
+    : `"${Math.round(stat.mtimeMs).toString(16)}-${size.toString(16)}"`;
   const headers = {
     'Content-Type': contentType,
     'Accept-Ranges': 'bytes',
@@ -80,11 +94,15 @@ export function sendFile(req, res, absPath, { contentType, cacheControl }) {
     headers['Content-Range'] = `bytes ${parsed.start}-${parsed.end}/${size}`;
     headers['Content-Length'] = parsed.end - parsed.start + 1;
     res.writeHead(206, headers);
-    bind(fs.createReadStream(absPath, parsed), res);
+    bind(fs.createReadStream(absPath, {
+      start: offset + parsed.start,
+      end: offset + parsed.end,
+    }), res);
     return;
   }
 
   headers['Content-Length'] = size;
   res.writeHead(200, headers);
-  bind(fs.createReadStream(absPath), res);
+  if (offset === 0 && size === stat.size) bind(fs.createReadStream(absPath), res);
+  else bind(fs.createReadStream(absPath, { start: offset, end: offset + size - 1 }), res);
 }
